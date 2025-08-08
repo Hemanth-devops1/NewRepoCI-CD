@@ -1,0 +1,99 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: order-service
+  REGISTRY: docker.io
+  DOCKER_USER: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASS: ${{ secrets.DOCKER_PASSWORD }}
+  GITOPS_REPO: git@github.com:your-org/gitops-repo.git
+  GIT_EMAIL: devops@example.com
+  GIT_USERNAME: DevOps Bot
+  GIT_BRANCH: main
+  ENV_PATH: dev/order-service/values.yaml
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v3
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Setup Snyk
+      uses: snyk/actions/setup@master
+      with:
+        version: latest
+
+    - name: Run Snyk test on code & dependencies
+      run: |
+        snyk test --all-projects
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    - name: Get short SHA
+      id: vars
+      run: echo "SHA_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+    - name: Log in to Docker Hub
+      run: echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+
+    - name: Build Docker image
+      run: |
+        docker build -t $REGISTRY/$DOCKER_USER/$IMAGE_NAME:${{ env.SHA_TAG }} .
+    
+    - name: Scan Docker image with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }}
+        format: table
+        exit-code: 0  # don't fail the build
+
+    - name: Push image to Docker Hub
+      run: |
+        docker push $REGISTRY/$DOCKER_USER/$IMAGE_NAME:${{ env.SHA_TAG }}
+
+    - name: Clone GitOps repo
+      run: |
+        git clone --depth=1 --branch $GIT_BRANCH $GITOPS_REPO gitops
+        cd gitops
+        git config user.name "$GIT_USERNAME"
+        git config user.email "$GIT_EMAIL"
+        yq e '.image.tag = "${{ env.SHA_TAG }}"' -i $ENV_PATH
+        git add $ENV_PATH
+        git commit -m "Update image tag to ${{ env.SHA_TAG }}"
+        git push origin $GIT_BRANCH
+      env:
+        GIT_SSH_COMMAND: "ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no"
+
+    - name: Notify on Slack
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_MESSAGE: |
+          ✅ CI completed for order-service
+          🐳 Docker tag: `${{ env.SHA_TAG }}`
+          🔁 GitOps updated
+          🔔 QA team may begin testing
+
+    - name: Send email notification (optional)
+      if: success()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.example.com
+        server_port: 587
+        username: ${{ secrets.EMAIL_USER }}
+        password: ${{ secrets.EMAIL_PASS }}
+        subject: "CI Passed for order-service ${{ env.SHA_TAG }}"
+        to: qa-team@example.com
+        from: DevOps CI
+        body: |
+          CI passed and image pushed: `${{ env.SHA_TAG }}`.
+          GitOps repo updated for dev. Please begin testing.
